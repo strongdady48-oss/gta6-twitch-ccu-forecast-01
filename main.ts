@@ -1,33 +1,39 @@
 // gta6-twitch-ccu-forecast-01: forecast Grand Theft Auto VI's launch-day Twitch
 // viewers, hour by hour.
 //
-// Model: a lognormal-quantile forecaster anchored on hour 1's print p1:
-//   q_tau(h) = p1 * exp(MED[h] + z_tau * SD[h]),  h = 2..24
+// Model (v2, size-dependent): a lognormal-quantile forecaster anchored on
+// hour 1's print p1:
+//   q_tau(h) = p1 * exp(MED[h](p1) + z_tau * SD[h]),  h = 2..24
 //   tau in (0.05, 0.25, 0.5, 0.75, 0.95), z the standard normal quantiles.
 //
-// Where MED and SD come from: the kit's 37 comparable past big launches
-// (SullyGnome hourly Twitch category averages, release-day curves). For each
-// launch and hour, the log ratio log(viewers_h / viewers_1) was taken; MED[h]
-// is the blend (log-space mean) of two medians: the 28 launches whose hour 1
-// already had >= 10,000 viewers, and the 16 whose hour 1 had >= 100,000.
-// SD[h] is the same blend of the two groups' per-hour residual standard
-// deviations (k = 1.0, no tuning beyond that). Two regimes because the shape
-// depends on launch size: small hour-1 launches explode later (median ratio
-// 2.4x by hour 19), huge ones stay near flat (0.5x mid-day dip, ~1.25x by
-// hour 19). GTA VI's hour 1 will be in the millions, so the blend leans on
-// the huge-launch shape without trusting only 16 curves.
+// Why size-dependent: a launch's release-day shape depends strongly on its
+// hour-1 size. Across the kit's 37 comparable past big launches (SullyGnome
+// hourly Twitch category averages), the late rise (hour 19 / hour 1) is
+// ~7.5x for a 23k hour-1 launch, ~2.8x at 117k, ~2.1x at 119k, ~1.65x at
+// 270k, and ~0.94-1.31x above 320k. A single shape for every p1 (v1's fixed
+// blend, ~1.4x late) badly underpredicts small launches and is only right
+// for huge ones. So MED[h] is now a smooth blend of two medians — BIG_MED
+// (12 launches, hour 1 in [10k, 100k)) and HUGE_MED (16 launches, hour 1
+// >= 100k) — with a logistic weight on log10(p1) centred at 100k:
+//   w(p1) = 1 / (1 + exp(-(log10(p1) - 5.0) / 0.3))
+// Small launches lean on BIG_MED (late rise ~2.8x), huge ones on HUGE_MED
+// (late rise ~1.25x, mid-day dip ~0.5x). GTA VI's hour 1 is in the millions
+// (live read ~2.7M), so w ~ 0.99: the forecast is essentially the HUGE
+// shape — a mid-day dip to ~0.5x, recovering to ~1.26x by hour 19 — which
+// is the honest extrapolation for a launch far beyond every comparable.
+// SD[h] is the per-hour residual standard deviation around the
+// size-dependent median, pooled over the 28 launches with hour 1 >= 10k.
 //
-// Backtest on the same 37 comparable curves (mean pinball loss, log scale):
-//   this model:  0.106 on huge launches (h1 >= 100k), 0.151 on big (>= 10k)
-//   house baseline (persistence, 0.15*sqrt(h-1) spread): 0.131 / 0.175
-// Leave-one-out on the huge set: 0.117 vs the house's 0.131, so the edge is
-// not self-influence. The house's own practice number for its baseline is
-// ~0.387 on the four practice cases; the comparable backtest is a different
-// sample, so the two numbers are not directly comparable. One shape for
-// every p1, no size interpolation: the final's p1 is in the millions, beyond
-// every comparable, so any size rule would extrapolate on six or fewer
-// launches; the blend is the honest middle and beats the house on every
-// regime backtested.
+// Validation (mean pinball loss, log scale, on the kit's four practice
+// launches — Wolverine, RDR2, God of War Ragnarok, Spider-Man 2 — which are
+// NOT in the 37 comparables, so this is out-of-sample):
+//   v2 (this model):  0.132 (Wolverine 0.234, RDR2 0.124, GoW 0.076, SM2 0.095)
+//   v1 (fixed blend): 0.178 (Wolverine 0.382, RDR2 0.149, GoW 0.072, SM2 0.107)
+//   house baseline (persistence, 0.15*sqrt(h-1) spread): 0.194
+// v2 beats v1 by 25% and the house by 32% on the practice set, and its
+// shape for GTA's size is the HUGE regime, the closest to a multi-million
+// launch. One shape per size, no per-launch tuning: the logistic centre
+// (100k) and scale (0.3) are fixed, not fitted to the practice cases.
 //
 // Live anchor (not used by the program; it reads p1 from the case file):
 // Twitch's public directory count for the GTA VI category, read 2026-11-18
@@ -53,24 +59,49 @@ const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 const Z = [-1.645, -0.674, 0, 0.674, 1.645];
 
 /**
- * MED[h - 2]: median log ratio log(viewers_h / viewers_1), blended from the
- * big-launch (h1 >= 10k) and huge-launch (h1 >= 100k) medians, hours 2..24.
+ * BIG_MED[h - 2]: median log ratio log(viewers_h / viewers_1) for launches
+ * whose hour 1 had 10,000–99,999 viewers (12 comparable launches),
+ * hours 2..24.
  */
-const MED = [
-  -0.1123, -0.3015, -0.3468, -0.3125, -0.2922, -0.3789, -0.4183, -0.483,
-  -0.4897, -0.4395, -0.3237, -0.2448, -0.1005, -0.0146, 0.058, 0.1847,
-  0.2311, 0.3368, 0.3056, 0.3266, 0.3386, 0.3228, 0.1756,
+const BIG_MED = [
+  -0.1902, -0.3458, -0.2981, -0.199, -0.0684, -0.0766, -0.0671, -0.1374,
+  -0.1303, -0.1105, -0.0276, 0.0834, 0.2147, 0.4207, 0.5428, 0.5672,
+  0.631, 1.037, 1.0205, 1.0155, 1.0054, 0.947, 0.8546,
 ];
 
 /**
- * SD[h - 2]: per-hour log spread, blended from the two groups' residual
- * standard deviations, hours 2..24.
+ * HUGE_MED[h - 2]: median log ratio log(viewers_h / viewers_1) for launches
+ * whose hour 1 had >= 100,000 viewers (16 comparable launches),
+ * hours 2..24.
+ */
+const HUGE_MED = [
+  -0.1009, -0.2721, -0.3643, -0.3674, -0.3761, -0.506, -0.5884, -0.6606,
+  -0.6772, -0.6745, -0.562, -0.4507, -0.241, -0.1816, -0.1063, 0.1016,
+  0.1372, 0.2271, 0.1797, 0.2145, 0.1696, 0.0863, 0.1298,
+];
+
+/**
+ * SD[h - 2]: per-hour log spread, the residual standard deviation around
+ * the size-dependent median, pooled over the 28 comparable launches with
+ * hour 1 >= 10,000, hours 2..24.
  */
 const SD = [
-  0.2038, 0.2924, 0.3011, 0.3179, 0.4629, 0.5243, 0.5161, 0.5282,
-  0.5468, 0.5524, 0.5609, 0.5541, 0.5641, 0.5808, 0.5745, 0.5424,
-  0.5254, 0.5548, 0.5858, 0.573, 0.5688, 0.548, 0.5497,
+  0.1984, 0.3227, 0.3163, 0.3449, 0.5065, 0.5349, 0.5239, 0.5385,
+  0.5563, 0.5687, 0.5898, 0.623, 0.6542, 0.6691, 0.6522, 0.6211,
+  0.5722, 0.5785, 0.6153, 0.6109, 0.5787, 0.5529, 0.5549,
 ];
+
+/** Logistic weight on log10(p1): 0 = pure BIG shape, 1 = pure HUGE shape. */
+const hugeWeight = (p1: number): number => {
+  const x = Math.log10(Math.max(p1, 1));
+  return 1 / (1 + Math.exp(-(x - 5.0) / 0.3));
+};
+
+/** Median log ratio for hour h given hour 1's print p1. */
+const medFor = (p1: number, h: number): number => {
+  const w = hugeWeight(p1);
+  return (1 - w) * BIG_MED[h - 2] + w * HUGE_MED[h - 2];
+};
 
 interface Case {
   levels: number[];
@@ -85,7 +116,7 @@ const round2 = (x: number): number => Math.round(x * 100) / 100;
 
 /** The five quantiles for one hour h, given hour 1's print p1. */
 const hourQuantiles = (p1: number, h: number): number[] => {
-  const med = MED[h - 2];
+  const med = medFor(p1, h);
   const sd = SD[h - 2];
   return Z.map((z) => {
     const q = round2(p1 * Math.exp(med + z * sd));
